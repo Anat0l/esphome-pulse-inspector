@@ -15,12 +15,14 @@ mirrors GPIO→GPIO in ISR and feeds edge streams to child modules.
 | MDB | `pulse_inspector_mdb` | MDB decoder | [README.en.md](pulse_inspector_mdb/README.en.md) |
 | EXE | `pulse_inspector_exe` | Executive decoder | [README.en.md](pulse_inspector_exe/README.en.md) |
 
-## One repository, multiple modules
+## Install from GitHub
 
 ```yaml
 external_components:
   - source:
-      type: local
+      type: git
+      url: https://github.com/Anat0l/esphome-pulse-inspector
+      ref: main
       path: components
     components: [pulse_inspector, pulse_inspector_mdb]
 ```

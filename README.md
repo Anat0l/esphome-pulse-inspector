@@ -49,7 +49,9 @@ English version: [README.en.md](README.en.md).
 ```yaml
 external_components:
   - source:
-      type: local
+      type: git
+      url: https://github.com/Anat0l/esphome-pulse-inspector
+      ref: main
       path: components
     components: [pulse_inspector]
 ```
@@ -118,7 +120,7 @@ pulse_inspector:
 
 Шаблон: [`components/pulse_inspector_logger`](components/pulse_inspector_logger).
 
-Подробнее о подключении нескольких модулей из одного репозитория — в
+Подробнее о подключении модулей с GitHub — в
 [components/README.md](components/README.md).
 
 ### Публичный API канала

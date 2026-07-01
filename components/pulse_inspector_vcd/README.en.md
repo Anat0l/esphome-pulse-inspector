@@ -40,7 +40,9 @@ Connect with `nc`/`ncat`/`socat`/PulseView, save to file, or open live in
 ```yaml
 external_components:
   - source:
-      type: local
+      type: git
+      url: https://github.com/Anat0l/esphome-pulse-inspector
+      ref: main
       path: components
     components: [pulse_inspector, pulse_inspector_vcd]
 

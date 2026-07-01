@@ -28,7 +28,9 @@ English version: [README.en.md](README.en.md).
 ```yaml
 external_components:
   - source:
-      type: local
+      type: git
+      url: https://github.com/Anat0l/esphome-pulse-inspector
+      ref: main
       path: components
     components: [pulse_inspector]
 

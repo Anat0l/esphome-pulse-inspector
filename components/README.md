@@ -17,12 +17,14 @@ English version: [README.en.md](README.en.md).
 | **PulseInspector MDB** | `pulse_inspector_mdb` | Декодер MDB + HA | [pulse_inspector_mdb/README.md](pulse_inspector_mdb/README.md) |
 | **PulseInspector EXE** | `pulse_inspector_exe` | Декодер линии Executive | [pulse_inspector_exe/README.md](pulse_inspector_exe/README.md) |
 
-## Подключение из одного репозитория
+## Подключение с GitHub
 
 ```yaml
 external_components:
   - source:
-      type: local
+      type: git
+      url: https://github.com/Anat0l/esphome-pulse-inspector
+      ref: main
       path: components
     components:
       - pulse_inspector
@@ -38,7 +40,9 @@ esp32:
 
 external_components:
   - source:
-      type: local
+      type: git
+      url: https://github.com/Anat0l/esphome-pulse-inspector
+      ref: main
       path: components
     components:
       - pulse_inspector
