@@ -1,0 +1,233 @@
+esphome:
+  name: pulse-inspector
+  friendly_name: Pulse Inspector
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+  level: DEBUG
+
+api:
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [pulse_inspector, pulse_inspector_logger, pulse_inspector_vcd, pulse_inspector_mdb, pulse_inspector_exe]
+
+pulse_inspector:
+  id: inspector
+  channels:
+    # MDB host line: on a cascaded Necta setup (VMC <Executive> coin mech
+    # <MDB> bill validator) this is the wire the coin mechanism drives --
+    # POLL, SETUP, BILL TYPE, ESCROW commands to the BV.
+    - id: ch_mdb_tx
+      input_pin: GPIO16
+      invert_in: true
+    # MDB peripheral line: the bill validator replies on this wire
+    # (ACK / POLL replies / SETUP config / bill-accepted events).
+    - id: ch_mdb_rx
+      input_pin: GPIO18
+      invert_in: true
+    # Executive line (VMC <-> coin mech). 8E1 @ 9600 per MEI Protocol A
+    # (same 11 bit-times on the wire as MDB 9N1, different interpretation).
+    - id: ch_exe_tx
+      input_pin: GPIO19
+      invert_in: false
+    - id: ch_exe_rx
+      input_pin: GPIO21
+      invert_in: true
+
+# Example of a child component subscribing to pulse_inspector via the
+# public pulse-callback API. Use this as a template for your own decoders
+# or injection modules.
+pulse_inspector_logger:
+  - id: logger_tx
+    channel_id: ch_mdb_tx
+    report_interval: 10s
+  - id: logger_rx
+    channel_id: ch_mdb_rx
+    report_interval: 10s
+
+# VCD exporter. Recommended capture client (see tools/README.md):
+#
+#   python tools/vcd_capture_tcp.py <device-ip> 9000 capture.vcd
+#
+# Alternatives: ncat / socat (see components/pulse_inspector_vcd/README.md).
+# The stream stays open as long as the client is connected: you get the
+# last `buffer_size` edges as pre-trigger history immediately, then live
+# events for as long as you want (minutes, hours, ...). Stop with Ctrl+C
+# and open the file in PulseView / GTKWave.
+pulse_inspector_vcd:
+  inspector_id: inspector
+  buffer_size: 4096
+  port: 9000
+  # Per-connection knobs. Defaults are tuned for moderately reliable
+  # Wi-Fi -- if your captures get cut off after 1-3 minutes, this is
+  # almost always the lwIP TCP retransmission timeout firing on a lossy
+  # link. The settings below catch a half-open connection actively
+  # (TCP keepalive) and keep stateful NATs/routers from reaping the
+  # flow as idle (application-layer $comment heartbeats).
+  send_timeout: 30s            # drop client if send() blocks this long
+  live_queue_depth: 1024       # per-connection edge queue (events)
+  app_keepalive_interval: 15s  # 0 = no $comment heartbeat
+  tcp_keepalive:
+    enabled: true
+    idle: 30s                  # silent time before first keepalive probe
+    interval: 10s              # gap between consecutive probes
+    count: 3                   # missed probes before declaring dead
+
+# Live NAMA MDB (Multi-Drop Bus) decoder in TWO-WIRE mode. Each physical
+# MDB wire is tapped on its own GPIO and decoded as an independent 9N1
+# UART @ 9600 bps. Host and peripheral bytes are attributed by wire, not
+# by the 9th bit, so multi-byte commands are correctly grouped.
+#
+# Context for this install: the tap sits between the coin mechanism
+# (acting as MDB host on this bus) and the bill validator. The VMC sees
+# the coin mech over a separate Executive bus, which is NOT decoded
+# here. As a result, the events we can observe on this wire are:
+#
+#   * BV POLL / SETUP / BILL_TYPE / ESCROW traffic
+#   * BV bill-accepted / stacked / returned / rejected events
+#   * BV faults (jam, disabled, reset, ROM error, ...)
+#   * A derived "sale cycle" signal, inferred from the BILL_TYPE
+#     enable-mask going to 00 00 when the coffee machine starts
+#     preparing a drink, and back to its usual value when the machine
+#     is ready to accept money again.
+#
+# Cashless, VEND/APPROVED/DENIED, changer, and selection_map events do
+# NOT appear on this bus — their sensors are therefore omitted below.
+pulse_inspector_mdb:
+  id: mdb
+  inspector_id: inspector
+  tx_channel: 0             # ch_mdb_tx (MDB host -> BV)
+  rx_channel: 1             # ch_mdb_rx (BV -> MDB host)
+  baud: 9600
+  log_slave_ack: false      # true = log every idle-ACK byte (very noisy)
+  log_raw_frames: false     # true = dump every decoded frame as hex
+  suppress_idle_polls: true # hide idle `33 33`+`00` / `10 10`+`00` pairs
+
+  on_bv_error:
+    - then:
+        - logger.log:
+            level: WARN
+            format: "BV: %s"
+            args: ['description.c_str()']
+  on_bill_accepted:
+    - then:
+        - homeassistant.event:
+            event: esphome.bv_bill_accepted
+            data_template:
+              bill_type: "{{ bill_type }}"
+              to_stacker: "{{ to_stacker }}"
+  on_sale_cycle_begin:
+    - then:
+        - homeassistant.event:
+            event: esphome.vm_sale_cycle_begin
+  on_sale_cycle_end:
+    - then:
+        - homeassistant.event:
+            event: esphome.vm_sale_cycle_end
+            data_template:
+              duration_ms: "{{ duration_ms }}"
+
+# Live Executive decoder. UART format is 8E1 @ 9600 per MEI Protocol A.
+# The executive (master) sources commands on its TX current loop, tapped
+# here as ch_exe_rx (GPIO21, channel index 3). The VMC reply wire is
+# ch_exe_tx (GPIO19, channel index 2). Channel names follow the YAML
+# ids above; see components/pulse_inspector_exe/README.md for roles.
+pulse_inspector_exe:
+  id: exe
+  inspector_id: inspector
+  executive_channel: 3       # ch_exe_rx (GPIO21) -- executive command wire
+  peripheral_channel: 2      # ch_exe_tx (GPIO19) -- VMC reply wire
+  baud: 9600
+  parity: even               # MEI Protocol A: 8E1
+  log_raw_frames: true
+  suppress_idle_polls: true
+  show_parity_in_hex: false
+
+sensor:
+  - platform: pulse_inspector_mdb
+    mdb_id: mdb
+    frames_decoded:
+      name: "MDB frames decoded"
+    framing_errors:
+      name: "MDB framing errors"
+    master_bytes:
+      name: "MDB host bytes"
+    slave_bytes:
+      name: "MDB peripheral bytes"
+    events_dropped:
+      name: "MDB events dropped"
+    proprietary_frames:
+      name: "MDB proprietary frames"
+    bills_stacked_count:
+      name: "Bills stacked"
+    bills_escrowed_count:
+      name: "Bills escrowed"
+    bills_returned_count:
+      name: "Bills returned"
+    bills_rejected_count:
+      name: "Bills rejected"
+    last_bill_type:
+      name: "Last bill type"
+    sale_cycles_total:
+      name: "Sale cycles total"
+    last_sale_duration:
+      name: "Last sale duration"
+  - platform: pulse_inspector_exe
+    exe_id: exe
+    frames_decoded:
+      name: "EXE bytes decoded"
+    framing_errors:
+      name: "EXE framing errors"
+    parity_errors:
+      name: "EXE parity errors"
+    master_bytes:
+      name: "EXE master bytes"
+    slave_bytes:
+      name: "EXE slave bytes"
+    master_frames:
+      name: "EXE master frames"
+    slave_frames:
+      name: "EXE slave frames"
+    idle_polls:
+      name: "EXE idle polls"
+    events_dropped:
+      name: "EXE events dropped"
+
+binary_sensor:
+  - platform: pulse_inspector_mdb
+    mdb_id: mdb
+    bv_jam:
+      name: "Bill validator jam"
+    bv_disabled:
+      name: "Bill validator disabled"
+    sale_cycle_in_progress:
+      name: "Vending: Sale in progress"
+
+text_sensor:
+  - platform: pulse_inspector_mdb
+    mdb_id: mdb
+    last_event:
+      name: "MDB: Last event"
+    last_bv_error:
+      name: "BV: Last error"
+    bv_enable_mask:
+      name: "BV: Enable+escrow mask"
+  - platform: pulse_inspector_exe
+    exe_id: exe
+    last_master_frame:
+      name: "EXE: Last master frame"
+    last_slave_frame:
+      name: "EXE: Last slave frame"
