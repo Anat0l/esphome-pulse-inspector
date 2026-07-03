@@ -32,6 +32,15 @@ pulse_inspector:
     # MDB host line: on a cascaded Necta setup (VMC <Executive> coin mech
     # <MDB> bill validator) this is the wire the coin mechanism drives --
     # POLL, SETUP, BILL TYPE, ESCROW commands to the BV.
+    #
+    # Optional per-channel knobs (defaults shown):
+    #   pull: up               # internal pull resistor: up / down / none.
+    #                          # Use `none` when an external divider or
+    #                          # optocoupler sets the line level.
+    #   min_pulse_width: 0us   # glitch filter (max 1000us): pulses shorter
+    #                          # than this are dropped before decoders see
+    #                          # them. Useful on long noisy lines where
+    #                          # spikes show up as framing errors.
     - id: ch_mdb_tx
       input_pin: GPIO16
       invert_in: true

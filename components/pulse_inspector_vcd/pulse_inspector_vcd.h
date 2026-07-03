@@ -17,11 +17,12 @@
 namespace esphome {
 namespace pulse_inspector_vcd {
 
-// Single captured edge, normalized to microseconds since boot.
-// Using uint32_t gives ~71 minutes before wrap — plenty for any practical
-// single-session capture, and halves the per-event RAM cost vs int64_t.
+// Single captured edge, in microseconds since boot (esp_timer time base,
+// copied straight from PulseItem). 64-bit so multi-hour captures and long
+// silent gaps never wrap or alias; packed to keep the ring buffer compact
+// (10 bytes/event -> 40 KB for the default 4096-event buffer).
 struct __attribute__((packed)) VcdEvent {
-  uint32_t t_us;
+  int64_t t_us;
   uint8_t ch_idx;
   uint8_t level;
 };

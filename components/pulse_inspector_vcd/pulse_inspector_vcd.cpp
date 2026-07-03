@@ -170,15 +170,9 @@ void PulseInspectorVcd::setup() {
 
 void PulseInspectorVcd::on_pulse(uint8_t ch_idx, const pulse_inspector::PulseItem &item) {
   VcdEvent ev{};
-#ifdef __XTENSA__
-  // item.cycle is xthal_get_ccount() (CPU cycles). Convert to microseconds
-  // assuming a 240 MHz CPU clock (ESP32 default). If you change the clock
-  // via `esp32 -> cpu_frequency`, update this divisor accordingly.
-  ev.t_us = item.cycle / 240u;
-#else
-  // On ESP32-C3/S2/S3 pulse_inspector stores esp_timer_get_time() (µs).
-  ev.t_us = item.cycle;
-#endif
+  // PulseItem.t_us is esp_timer_get_time() microseconds on every ESP32
+  // variant -- no CPU-frequency assumptions, no cycle-counter conversion.
+  ev.t_us = item.t_us;
   ev.ch_idx = ch_idx;
   ev.level = item.level ? 1 : 0;
 
@@ -384,20 +378,20 @@ void PulseInspectorVcd::serve_client_(int client_sock) {
   // event in the pre-trigger snapshot; if the ring buffer was empty, we
   // defer picking t0 until the first live event arrives.
   bool have_t0 = false;
-  uint32_t t0 = 0;
-  uint32_t last_t_emitted = 0;  // enforces monotonic `#t` markers
+  int64_t t0 = 0;
+  int64_t last_t_emitted = 0;  // enforces monotonic `#t` markers
 
   auto emit_event = [&](const VcdEvent &e) {
     if (!have_t0) {
       t0 = e.t_us;
       have_t0 = true;
     }
-    uint32_t t = e.t_us - t0;
+    int64_t t = e.t_us - t0;
     // Events from different channel tasks can arrive slightly out of
     // timestamp order. VCD requires #t to be non-decreasing, so clamp.
     if (t < last_t_emitted) t = last_t_emitted;
     if (t != last_t_emitted) {
-      out.printfln("#%u\n", (unsigned) t);
+      out.printfln("#%llu\n", (unsigned long long) t);
       last_t_emitted = t;
     }
     if ((size_t) e.ch_idx < symbols_.size()) {

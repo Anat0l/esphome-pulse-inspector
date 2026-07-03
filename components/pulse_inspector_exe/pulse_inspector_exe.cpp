@@ -262,7 +262,11 @@ void PulseInspectorExe::on_pulse(ChannelCtx *ctx,
     this->events_dropped_++;
     return;
   }
-  this->on_edge_locked_(ctx, item.cycle, item.level);
+  // PulseItem.t_us is 64-bit esp_timer microseconds. The UART layer only
+  // ever computes short deltas (bit/byte times, inter-byte gaps), so a
+  // uint32 truncation is safe: unsigned subtraction stays correct across
+  // the ~71.6 min wrap as long as individual deltas are far below it.
+  this->on_edge_locked_(ctx, (uint32_t) item.t_us, item.level);
   xSemaphoreGive(this->mutex_);
 }
 

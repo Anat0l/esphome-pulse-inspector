@@ -20,11 +20,16 @@ namespace esphome {
 namespace pulse_inspector {
 
 // Minimum event shoved from the ISR into the per-channel queue. We keep it
-// tiny on purpose: copying more than a few bytes in an ISR is painful and
+// small on purpose: copying more than a few bytes in an ISR is painful and
 // we want the queue to hold as many events as possible.
+//
+// `t_us` is esp_timer_get_time() taken inside the ISR: microseconds since
+// boot, 64-bit, identical on every ESP32 variant (Xtensa and RISC-V alike).
+// It never wraps in practice (~292k years), so consumers can subtract
+// timestamps freely without wrap-around handling.
 struct PulseItem {
-  uint32_t cycle;  // xthal_get_ccount() at the moment of the edge
-  bool level;      // new logical level (after invert_in is applied)
+  int64_t t_us;  // esp_timer_get_time() at the moment of the edge
+  bool level;    // new logical level (after invert_in is applied)
 };
 
 // Callback invoked for every PulseItem drained by the background task.
@@ -39,6 +44,13 @@ using PulseCallback = std::function<void(const PulseItem &)>;
 // decoder components can share the same surface.
 using PacketCallback = std::function<void(const uint8_t *data, size_t len)>;
 
+// Pull resistor applied to the input pin during setup().
+enum class InputPull : uint8_t {
+  NONE = 0,
+  UP = 1,
+  DOWN = 2,
+};
+
 class PulseInspectorChannel {
  public:
   void set_input_pin(InternalGPIOPin *pin) { this->input_pin_ = pin; }
@@ -46,6 +58,10 @@ class PulseInspectorChannel {
   void set_invert_in(bool v) { this->invert_in_ = v; }
   void set_invert_out(bool v) { this->invert_out_ = v; }
   void set_queue_size(size_t v) { this->queue_size_ = v; }
+  void set_pull(InputPull v) { this->pull_ = v; }
+  // Glitch filter: pulses shorter than this many microseconds are dropped
+  // in the channel task before callbacks fire. 0 disables the filter.
+  void set_min_pulse_width_us(uint32_t v) { this->min_pulse_width_us_ = v; }
 
   // Initialize GPIO, queue and background task. Returns true on success.
   bool setup();
@@ -116,12 +132,20 @@ class PulseInspectorChannel {
   static void task_trampoline(void *arg);
   void task_loop();
 
+  // Dispatch one item to all subscribers (helper for task_loop()).
+  void dispatch_(const PulseItem &item) {
+    this->task_processed_count_++;
+    this->pulse_callbacks_.call(item);
+  }
+
   // Configuration.
   InternalGPIOPin *input_pin_{nullptr};
   InternalGPIOPin *output_pin_{nullptr};
   bool invert_in_{false};
   bool invert_out_{false};
   size_t queue_size_{256};
+  InputPull pull_{InputPull::UP};
+  uint32_t min_pulse_width_us_{0};
 
   // Cached raw pin numbers so the ISR can touch GPIO registers directly
   // without going through the (non IRAM-safe) HAL.
@@ -137,6 +161,7 @@ class PulseInspectorChannel {
   volatile uint32_t edge_count_{0};
   volatile uint32_t queue_overflow_count_{0};
   volatile uint32_t task_processed_count_{0};
+  uint32_t glitches_filtered_{0};  // edges dropped by the min_pulse_width filter
   uint32_t last_logged_edge_count_{0};
   uint32_t last_logged_overflow_count_{0};
 

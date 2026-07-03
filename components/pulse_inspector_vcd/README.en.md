@@ -20,6 +20,11 @@ Connect with `nc`/`ncat`/`socat`/PulseView, save to file, or open live in
 [GTKWave](https://gtkwave.sourceforge.net/) and add protocol decoders
 (UART, I²C, SPI, …).
 
+> ⚠️ **Security.** The TCP server binds to all interfaces and has **no
+> authentication** — any host on your Wi-Fi network can dump the bus.
+> This is a debugging tool: enable it only while debugging and keep it
+> commented out in production configs.
+
 ## Features
 
 - Captures **all** parent `pulse_inspector` channels (up to 94 wires per
