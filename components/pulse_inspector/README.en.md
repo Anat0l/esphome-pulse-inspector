@@ -46,10 +46,23 @@ pulse_inspector:
 
 | Option | Default | Description |
 |---|---|---|
-| `input_pin` | required | Input, pull-up, any-edge IRQ |
+| `input_pin` | required | Input, any-edge IRQ |
 | `output_pin` | optional | Mirror output; omit for receive-only |
 | `invert_in` / `invert_out` | `false` | Logic inversion |
 | `queue_size` | `256` | Pulse queue depth (16..8192) |
+| `pull` | `up` | Internal input pull resistor: `up` / `down` / `none`. Use `none` with external dividers / optocouplers. |
+| `min_pulse_width` | `0us` (off) | Glitch filter: pulses shorter than this (max `1000us`) are dropped in the channel task before callbacks fire. |
+
+### Time base
+
+Every edge is stamped with `PulseItem.t_us` — 64-bit microseconds from
+`esp_timer_get_time()`, identical on all ESP32 variants and independent of
+`cpu_frequency`.
+
+> **Breaking change:** the field was previously named `PulseItem.cycle`
+> and held CPU cycle counts on Xtensa targets. Custom components built on
+> `add_on_pulse_callback()` must switch to `item.t_us` and drop any
+> tick-to-µs conversion.
 
 ## ESPHome metadata
 

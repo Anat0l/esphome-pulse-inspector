@@ -8,22 +8,20 @@
 #include "soc/gpio_reg.h"
 #include "soc/soc_caps.h"
 
-#ifdef __XTENSA__
-#include "xtensa/hal.h"
-#endif
-
 namespace esphome {
 namespace pulse_inspector {
 
 static const char *const TAG = "pulse_inspector";
 
-// Stack depth and priority for the per-channel task. The task reads
-// PulseItems from the queue and dispatches them to user callbacks. Keep
-// the stack generous: downstream components (e.g. pulse_inspector_mdb)
-// can do snprintf, FreeRTOS queue operations, and other moderately
-// stack-hungry work inside the callback, and we want a comfortable margin
-// to survive nested compiler inlining + libc working buffers.
-static constexpr uint32_t TASK_STACK_WORDS = 4096;
+// Stack size (in BYTES -- ESP-IDF's xTaskCreate takes bytes, unlike
+// vanilla FreeRTOS which takes words) and priority for the per-channel
+// task. The task reads PulseItems from the queue and dispatches them to
+// user callbacks. Keep the stack generous: downstream components (e.g.
+// pulse_inspector_mdb) can do snprintf, FreeRTOS queue operations, and
+// other moderately stack-hungry work inside the callback, and we want a
+// comfortable margin to survive nested compiler inlining + libc working
+// buffers.
+static constexpr uint32_t TASK_STACK_BYTES = 4096;
 static constexpr UBaseType_t TASK_PRIORITY = 1;
 
 // How often we dump diagnostics to the log (ms).
@@ -80,10 +78,25 @@ bool PulseInspectorChannel::setup() {
     this->output_gpio_num_ = this->output_pin_->get_pin();
   }
 
-  // Configure input pin: ANY-edge interrupt, pull-up.
+  // Configure input pin: ANY-edge interrupt + user-selected pull resistor
+  // (default pull-up, matching the historical hard-coded behavior). On
+  // lines with an external divider / optocoupler the internal ~45 kOhm
+  // pull-up shifts levels, so `pull: none` (or `down`) must be available.
   gpio_num_t in_num = (gpio_num_t) this->input_gpio_num_;
   gpio_set_direction(in_num, GPIO_MODE_INPUT);
-  gpio_set_pull_mode(in_num, GPIO_PULLUP_ONLY);
+  gpio_pull_mode_t pull_mode;
+  switch (this->pull_) {
+    case InputPull::UP:
+      pull_mode = GPIO_PULLUP_ONLY;
+      break;
+    case InputPull::DOWN:
+      pull_mode = GPIO_PULLDOWN_ONLY;
+      break;
+    default:
+      pull_mode = GPIO_FLOATING;
+      break;
+  }
+  gpio_set_pull_mode(in_num, pull_mode);
   gpio_set_intr_type(in_num, GPIO_INTR_ANYEDGE);
 
   // Configure output pin (if any) and pre-mirror current input level so we
@@ -132,7 +145,7 @@ bool PulseInspectorChannel::start_processing() {
   }
 
   BaseType_t task_ret = xTaskCreate(&PulseInspectorChannel::task_trampoline, "pi_ch",
-                                    TASK_STACK_WORDS, this, TASK_PRIORITY, &this->task_);
+                                    TASK_STACK_BYTES, this, TASK_PRIORITY, &this->task_);
   if (task_ret != pdPASS) {
     ESP_LOGE(TAG, "GPIO%d: failed to create task (err=%d)", this->input_gpio_num_, (int) task_ret);
     return false;
@@ -154,11 +167,11 @@ void IRAM_ATTR PulseInspectorChannel::on_edge() {
   BaseType_t higher_priority_task_woken = pdFALSE;
 
   PulseItem item;
-#ifdef __XTENSA__
-  item.cycle = xthal_get_ccount();
-#else
-  item.cycle = (uint32_t) esp_timer_get_time();
-#endif
+  // esp_timer_get_time() is IRAM-safe and gives 64-bit microseconds since
+  // boot on every ESP32 variant. This is the single time base for all
+  // consumers (decoders, VCD, ...) -- no per-arch cycle-counter handling,
+  // no 32-bit wrap-around on quiet lines.
+  item.t_us = esp_timer_get_time();
   item.level = (bool) gpio_get_level_iram(this->input_gpio_num_) ^ this->invert_in_;
 
   // Mirror to the output pin as fast as possible - this is the whole point
@@ -184,20 +197,69 @@ void PulseInspectorChannel::task_trampoline(void *arg) {
 }
 
 void PulseInspectorChannel::task_loop() {
-  PulseItem item;
+  // Fast path: no glitch filter. Every queued edge is dispatched to the
+  // child components as-is. Callbacks run in this task context; if they
+  // need to touch thread-unsafe ESPHome APIs (sensor state, network,
+  // etc.) they should defer the work via Component::defer() or
+  // App.scheduler to the main loop.
+  if (this->min_pulse_width_us_ == 0) {
+    PulseItem item;
+    for (;;) {
+      if (xQueueReceive(this->queue_, &item, portMAX_DELAY) != pdTRUE) {
+        continue;
+      }
+      this->dispatch_(item);
+    }
+  }
+
+  // Glitch-filter path. A pulse is defined by two consecutive edges; if
+  // they are closer together than min_pulse_width_us_, both edges are
+  // dropped (the line returned to its previous level, so downstream
+  // consumers never see the spike). To decide whether a lone edge starts
+  // a glitch we may have to wait up to min_pulse_width_us_ for the
+  // closing edge; since the threshold is bounded to <= 1000 us by the
+  // YAML schema, a short yield-poll loop is cheaper and far more precise
+  // than a FreeRTOS tick-based timeout (1 tick = typically 10 ms, which
+  // would delay dispatch enough to break UART decoders' inter-byte
+  // timers). On a busy line the closing edge is normally already queued,
+  // so the poll loop exits immediately.
+  const int64_t min_w = (int64_t) this->min_pulse_width_us_;
+  PulseItem pending;
+  bool have_pending = false;
   for (;;) {
-    BaseType_t ret = xQueueReceive(this->queue_, &item, portMAX_DELAY);
-    if (ret != pdTRUE) {
+    if (!have_pending) {
+      if (xQueueReceive(this->queue_, &pending, portMAX_DELAY) != pdTRUE) {
+        continue;
+      }
+      have_pending = true;
+    }
+
+    PulseItem next;
+    bool got_next = false;
+    while (esp_timer_get_time() - pending.t_us < min_w) {
+      if (xQueueReceive(this->queue_, &next, 0) == pdTRUE) {
+        got_next = true;
+        break;
+      }
+      taskYIELD();
+    }
+    if (!got_next && xQueueReceive(this->queue_, &next, 0) == pdTRUE) {
+      got_next = true;
+    }
+
+    if (got_next && (next.t_us - pending.t_us) < min_w) {
+      // Glitch: two edges within the threshold. Drop both.
+      this->glitches_filtered_ += 2;
+      have_pending = false;
       continue;
     }
 
-    this->task_processed_count_++;
-
-    // Dispatch to child components. Callbacks run in this task context;
-    // if they need to touch thread-unsafe ESPHome APIs (sensor state,
-    // network, etc.) they should defer the work via Component::defer()
-    // or App.scheduler to the main loop.
-    this->pulse_callbacks_.call(item);
+    this->dispatch_(pending);
+    if (got_next) {
+      pending = next;
+    } else {
+      have_pending = false;
+    }
   }
 }
 
@@ -212,6 +274,14 @@ void PulseInspectorChannel::dump_config(size_t index) const {
     ESP_LOGCONFIG(TAG, "    Output pin: (none, receive-only)");
   }
   ESP_LOGCONFIG(TAG, "    Queue size: %u", (unsigned) this->queue_size_);
+  const char *pull_str =
+      this->pull_ == InputPull::UP ? "up" : (this->pull_ == InputPull::DOWN ? "down" : "none");
+  ESP_LOGCONFIG(TAG, "    Pull: %s", pull_str);
+  if (this->min_pulse_width_us_ != 0) {
+    ESP_LOGCONFIG(TAG, "    Glitch filter: %u us", (unsigned) this->min_pulse_width_us_);
+  } else {
+    ESP_LOGCONFIG(TAG, "    Glitch filter: disabled");
+  }
 }
 
 void PulseInspectorChannel::log_diagnostics(size_t index) {
@@ -221,10 +291,11 @@ void PulseInspectorChannel::log_diagnostics(size_t index) {
   uint32_t delta_overflows = overflows - this->last_logged_overflow_count_;
 
   ESP_LOGD(TAG,
-           "ch%u GPIO%d: edges=%u (+%u) overflows=%u (+%u) processed=%u",
+           "ch%u GPIO%d: edges=%u (+%u) overflows=%u (+%u) processed=%u filtered=%u",
            (unsigned) index, this->input_gpio_num_, (unsigned) edges, (unsigned) delta_edges,
            (unsigned) overflows, (unsigned) delta_overflows,
-           (unsigned) this->task_processed_count_);
+           (unsigned) this->task_processed_count_,
+           (unsigned) this->glitches_filtered_);
 
   this->last_logged_edge_count_ = edges;
   this->last_logged_overflow_count_ = overflows;
